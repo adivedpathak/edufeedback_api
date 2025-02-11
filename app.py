@@ -1,65 +1,156 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import gdown
-import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image
-import io
-import re
-import os
+from flask import Flask, request, jsonify
+import requests
+import PyPDF2
+from io import BytesIO
+from urllib.parse import urlparse, parse_qs
 
-# Set the tesseract executable path (if needed)
-pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+app = Flask(__name__)
 
-app = FastAPI()
+class DriveTextExtractor:
+    def __init__(self):
+        """Initialize the text extractor"""
+        self.session = requests.Session()
 
-class PDFRequest(BaseModel):
-    url: str
-
-# Function to extract file ID from Google Drive URL
-def extract_file_id_from_url(url: str):
-    match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
-    return match.group(1) if match else None
-
-# Function to download the PDF from Google Drive
-def download_pdf_from_drive(file_id: str):
-    url = f"https://drive.google.com/uc?id={file_id}"
-    output = "downloaded_file.pdf"
-    gdown.download(url, output, quiet=False)
-    return output
-
-# Function to extract text from the PDF using OCR
-def extract_text_from_pdf(pdf_file_path: str):
-    doc = fitz.open(pdf_file_path)
-    full_text = ""
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        pix = page.get_pixmap()
-        img = Image.open(io.BytesIO(pix.tobytes()))
-        text = pytesseract.image_to_string(img)
-        full_text += text
-    return full_text
-
-@app.post("/extract_text/")
-def extract_text(pdf_request: PDFRequest):
-    file_id = extract_file_id_from_url(pdf_request.url)
-    if not file_id:
-        raise HTTPException(status_code=400, detail="Invalid Google Drive URL")
+    def convert_to_download_link(self, drive_link):
+        """
+        Convert Google Drive sharing link to direct download link
+        
+        Args:
+            drive_link (str): Google Drive sharing link
+            
+        Returns:
+            str: Direct download link
+        """
+        # Parse the URL
+        parsed = urlparse(drive_link)
+        
+        # Handle different Google Drive URL formats
+        if 'drive.google.com/file/d/' in drive_link:
+            # Extract file ID
+            file_id = drive_link.split('/file/d/')[1].split('/')[0]
+            return f'https://drive.google.com/uc?export=download&id={file_id}'
+        
+        elif 'drive.google.com/open' in drive_link:
+            # Parse query parameters
+            params = parse_qs(parsed.query)
+            file_id = params.get('id', [None])[0]
+            if file_id:
+                return f'https://drive.google.com/uc?export=download&id={file_id}'
+            
+        return drive_link
     
+    def download_pdf(self, drive_link):
+        """
+        Download PDF from Google Drive
+        
+        Args:
+            drive_link (str): Google Drive link
+            
+        Returns:
+            BytesIO: PDF file content
+        """
+        try:
+            # Convert to download link
+            download_link = self.convert_to_download_link(drive_link)
+            
+            # Download the file
+            response = self.session.get(download_link, stream=True)
+            response.raise_for_status()
+            
+            # Check if we got the PDF or a download page
+            content_type = response.headers.get('content-type', '')
+            
+            if 'text/html' in content_type:
+                # Handle large files that need confirmation
+                # Extract the confirm token
+                for line in response.iter_lines():
+                    if b'confirm=' in line:
+                        confirm_token = line.decode().split('confirm=')[1].split('"')[0]
+                        # Get the file with confirmation
+                        response = self.session.get(
+                            f"{download_link}&confirm={confirm_token}",
+                            stream=True
+                        )
+                        response.raise_for_status()
+                        break
+            
+            return BytesIO(response.content)
+            
+        except Exception as e:
+            raise Exception(f"Error downloading PDF: {str(e)}")
+    
+    def extract_text(self, pdf_file):
+        """
+        Extract text from PDF
+        
+        Args:
+            pdf_file (BytesIO): PDF file content
+            
+        Returns:
+            str: Extracted text
+        """
+        try:
+            # Read PDF
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            # Extract text from all pages
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            
+            return text.strip()
+            
+        except Exception as e:
+            raise Exception(f"Error extracting text: {str(e)}")
+
+# Initialize extractor
+extractor = DriveTextExtractor()
+
+@app.route('/extract-text', methods=['POST'])
+def extract_text():
+    """
+    API endpoint to extract text from Google Drive PDF
+    
+    Expected JSON input:
+    {
+        "drive_link": "https://drive.google.com/file/d/..."
+    }
+    """
     try:
-        pdf_path = download_pdf_from_drive(file_id)
+        # Get drive link from request
+        data = request.get_json()
+        
+        if not data or 'drive_link' not in data:
+            return jsonify({
+                'error': 'Missing drive_link in request body'
+            }), 400
+        
+        drive_link = data['drive_link']
+        
+        # Download PDF
+        pdf_file = extractor.download_pdf(drive_link)
+        
+        # Extract text
+        text = extractor.extract_text(pdf_file)
+        
+        return jsonify({
+            'success': True,
+            'text': text
+        })
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
-    
-    try:
-        extracted_text = extract_text_from_pdf(pdf_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
-    
-    os.remove(pdf_path)  # Clean up the downloaded file
-    return {"extracted_text": extracted_text}
-import uvicorn
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'message': 'Service is running'
+    })
 
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
